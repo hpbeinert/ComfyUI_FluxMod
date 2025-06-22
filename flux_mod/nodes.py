@@ -4,7 +4,7 @@ import json
 import torch
 import folder_paths
 
-from .loader import load_flux_mod
+from .loader import load_flux_mod, load_flux_lite_mod
 from .sampler import common_ksampler
 import comfy.samplers
 import comfy.cli_args
@@ -78,6 +78,66 @@ class FluxModDiffusionLoader:
         )
         return (flux_mod,)
 
+
+class FluxLiteModDiffusionLoader:
+    NodeId = "FluxLiteModDiffusionLoader"
+    NodeName = "FluxLiteMod Unified Model Loader"
+
+    @classmethod
+    def INPUT_TYPES(s):
+        patches = ["None"] + folder_paths.get_filename_list("diffusion_models")
+        checkpoint_paths = folder_paths.get_filename_list("diffusion_models")
+        if "unet_gguf" in folder_paths.folder_names_and_paths:
+            checkpoint_paths = checkpoint_paths + folder_paths.get_filename_list(
+                "unet_gguf"
+            )
+        return {
+            "required": {
+                "unet_name": (checkpoint_paths, {"tooltip": "This loads both .safetensors and .GGUF models if ComfyUI-GGUF is installed."}),
+                "guidance_name": (patches,),
+                "quant_mode": (
+                    ["bf16", "float8_e4m3fn (8 bit)", "float8_e5m2 (also 8 bit)"],
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "load_unet"
+    CATEGORY = "advanced/FluxMod"
+
+    def load_unet(
+        self, *, unet_name, quant_mode, guidance_name=None, lite_patch_unet_name=None
+    ):
+        dtypes = {
+            "bf16": torch.bfloat16,
+            "float8_e4m3fn (8 bit)": torch.float8_e4m3fn,
+            "float8_e5m2 (also 8 bit)": torch.float8_e5m2,
+        }
+
+        is_gguf = unet_name.lower().endswith(".gguf")
+        unet_path = folder_paths.get_full_path(
+            "unet_gguf" if is_gguf else "diffusion_models", unet_name
+        )
+        if guidance_name is not None:
+            guidance_path = folder_paths.get_full_path(
+                "diffusion_models", guidance_name
+            )
+        else:
+            guidance_path = None
+        if lite_patch_unet_name is not None:
+            lite_patch_unet_name = folder_paths.get_full_path(
+                "diffusion_models", lite_patch_unet_name
+            )
+        flux_mod = load_flux_lite_mod(
+            model_path=unet_path,
+            timestep_guidance_path=guidance_path,
+            linear_dtypes=dtypes[quant_mode],
+            lite_patch_path=lite_patch_unet_name,
+            is_gguf=is_gguf,
+        )
+        return (flux_mod,)
+    
 
 class FluxModDiffusionLoaderMini(FluxModDiffusionLoader):
     NodeId = "FluxModDiffusionLoaderMini"
@@ -420,6 +480,7 @@ class FluxModSamplerWrapperNode:
 node_list = [
     # loaders
     FluxModDiffusionLoader,
+    FluxLiteModDiffusionLoader,
     FluxModDiffusionLoaderMini,
     ChromaDiffusionLoader,
     # Sampler

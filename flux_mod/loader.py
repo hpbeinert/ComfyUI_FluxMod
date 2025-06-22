@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from safetensors.torch import safe_open
-from .model import FluxParams, FluxMod
+from .model import FluxParams, FluxMod, FluxLiteMod
 from .layers import Approximator
 import comfy
 import comfy.model_patcher
@@ -234,6 +234,125 @@ def load_flux_mod(model_path, timestep_guidance_path=None, linear_dtypes=torch.b
         # model.diffusion_model.double_blocks[4].load_state_dict(comfy.utils.load_torch_file(lite_patch_path))
 
     model.diffusion_model.distilled_guidance_layer = Approximator(64 if lite_patch_path is None else 32, 3072, 5120, n_layers, operations=operations)
+    model.diffusion_model.distilled_guidance_layer.load_state_dict(timestep_state_dict)
+    model.diffusion_model.dtype = unet_dtype
+    model.diffusion_model.eval()
+    if not is_gguf:
+        model.diffusion_model.to(unet_dtype)
+        # we cast to fp8 for mixed matmul ops but omit the picky and sensitive layers
+        cast_layers(model.diffusion_model, nn.Linear, dtype=linear_dtypes, exclude_keywords={"img_in", "final_layer", "scale"})
+        if model_management.force_channels_last():
+            model.diffusion_model.to(memory_format=torch.channels_last)
+
+    model_patcher = modelpatcher_class(
+        model,
+        load_device = load_device,
+        offload_device = offload_device,
+    )
+    return model_patcher
+
+
+def load_flux_lite_mod(model_path, timestep_guidance_path=None, linear_dtypes=torch.bfloat16, lite_patch_path=None, is_gguf=False):
+
+    if is_gguf:
+        ensure_gguf()
+    # just load safetensors here
+    state_dict = load_selected_keys(model_path, {"mod", "time_in", "guidance_in", "vector_in"}, is_gguf=is_gguf)
+
+    if timestep_guidance_path is None:
+        # Chroma mode - we expect the timestep guidance to be bundled under
+        # the key distilled_guidance_layer.
+        if lite_patch_path is not None:
+            raise ValueError("Internal error: lite patch specified in Chroma loader mode")
+        timestep_state_dict = {
+            k[25:]: v
+            for k, v in state_dict.items()
+            if k.startswith("distilled_guidance_layer.")
+        }
+        if not timestep_state_dict:
+            raise RuntimeError("Could not find distilled guidance layer in Chroma model")
+        n_layers = 0
+        for key in timestep_state_dict:
+            keysplit = key.split(".", 2)
+            if (
+                len(keysplit) == 3 and
+                keysplit[0] == "norms" and
+                keysplit[1].isnumeric() and
+                keysplit[2] == "scale"
+            ):
+                n_layers = max(n_layers, int(keysplit[1]) + 1)
+            del state_dict[f"distilled_guidance_layer.{key}"]
+        if n_layers == 0:
+            raise RuntimeError("Could not determine number of distilled guidance layers in Chroma model")
+    else:
+        timestep_state_dict = comfy.utils.load_torch_file(timestep_guidance_path)
+
+        n_layers = 5
+        # if "v3" in timestep_guidance_path:
+        #     n_layers = 6
+        # elif "v2" in timestep_guidance_path:
+        #     n_layers = 5
+        # else:
+        #     n_layers = 4
+
+    param_count = sum(x.numel() for x in state_dict.values())
+    unet_dtype = torch.bfloat16
+
+    load_device = model_management.get_torch_device()
+    offload_device = model_management.unet_offload_device()
+
+
+    params=FluxParams(
+        in_channels=64,
+        vec_in_dim=768,
+        context_in_dim=4096,
+        hidden_size=3072,
+        mlp_ratio=4.0,
+        num_heads=24,
+        depth=8,
+        depth_single_blocks=38,
+        axes_dim=[16, 56, 56],
+        theta=10_000,
+        qkv_bias=True,
+        guidance_embed=False,
+    )
+
+    model_conf = ExternalFlux()
+    model_class = ChromaFluxModel if timestep_guidance_path is None else ExternalFluxModel
+    model = model_class(
+        model_conf,
+        model_type=comfy.model_base.ModelType.FLUX,
+        device=model_management.get_torch_device()
+    )
+    unet_config = model_conf.unet_config
+    if is_gguf:
+        operations = model_conf.custom_operations = gguf.ops.GGMLOps()
+        modelpatcher_class = gguf.nodes.GGUFModelPatcher
+    else:
+        modelpatcher_class = comfy.model_patcher.ModelPatcher
+    if model_conf.custom_operations is None:
+        fp8 = model_conf.optimizations.get("fp8", model_conf.scaled_fp8 is not None)
+        operations = comfy.ops.pick_operations(
+            unet_config.get("dtype"),
+            model.manual_cast_dtype,
+            fp8_optimizations=fp8,
+            scaled_fp8=model_conf.scaled_fp8,
+        )
+    else:
+        operations = model_conf.custom_operations
+    
+    model.diffusion_model = FluxLiteMod(params=params, dtype=unet_dtype, operations=operations)
+
+    model.diffusion_model.load_state_dict(state_dict)
+    
+    # if lite_patch_path is not None:
+    #     model.diffusion_model.lite = True
+        # for _ in range(5,16):
+        #     del model.diffusion_model.double_blocks[5]
+
+        # model.diffusion_model.double_blocks[4].load_state_dict(comfy.utils.load_torch_file(lite_patch_path))
+
+    model.diffusion_model.distilled_guidance_layer = Approximator(32, 3072, 5120, n_layers, operations=operations)
     model.diffusion_model.distilled_guidance_layer.load_state_dict(timestep_state_dict)
     model.diffusion_model.dtype = unet_dtype
     model.diffusion_model.eval()
